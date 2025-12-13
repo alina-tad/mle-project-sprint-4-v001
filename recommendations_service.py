@@ -22,6 +22,11 @@ S3_BUCKET = os.environ["S3_BUCKET_NAME"]
 S3_ENDPOINT = os.environ["MLFLOW_S3_ENDPOINT_URL"]
 AWS_KEY = os.environ["AWS_ACCESS_KEY_ID"]
 AWS_SECRET = os.environ["AWS_SECRET_ACCESS_KEY"]
+HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "2.0"))
+EVENTS_K_LAST = int(os.getenv("EVENTS_K_LAST", "3"))
+
+ONLINE_WEIGHT = int(os.getenv("ONLINE_WEIGHT", "1"))   # сколько online подряд
+OFFLINE_WEIGHT = int(os.getenv("OFFLINE_WEIGHT", "1")) # сколько offline подряд
 
 OFFLINE_KEY = "recsys/recommendations/recommendations.parquet"   # финальные офлайн
 TOP_KEY = "recsys/recommendations/top_popular.parquet"          # дефолт
@@ -48,21 +53,30 @@ class Recommendations:
         self._recs = {"personal": None, "default": None}
         self._stats = {"request_personal_count": 0, "request_default_count": 0}
 
-    def load_personal(self, df: pd.DataFrame):
-        # ожидаем user_id, item_id, rank/score
+    def load_personal(self, df: pd.DataFrame | None):
+        if df is None or df.empty:
+            logger.warning("Personal recs are empty: fallback will always use default")
+            self._recs["personal"] = None
+            return
         self._recs["personal"] = df.set_index("user_id").sort_index()
 
-    def load_default(self, df: pd.DataFrame):
+    def load_default(self, df: pd.DataFrame | None):
+        if df is None or df.empty:
+            raise ValueError("Default recs (top_popular) are empty — service can't work")
         self._recs["default"] = df
 
     def get_offline(self, user_id: int, k: int = 100):
         try:
-            recs = self._recs["personal"].loc[user_id]
-            if isinstance(recs, pd.Series):
-                recs = recs.to_frame().T
-            recs = recs["item_id"].tolist()[:k]
-            self._stats["request_personal_count"] += 1
-            return recs
+            if self._recs["personal"] is not None:
+                recs = self._recs["personal"].loc[user_id]
+                if isinstance(recs, pd.Series):
+                    recs = recs.to_frame().T
+                recs = recs["item_id"].tolist()[:k]
+                self._stats["request_personal_count"] += 1
+                return recs
+
+            raise KeyError  # сразу уходим в default
+
         except KeyError:
             recs = self._recs["default"]["item_id"].to_list()[:k]
             self._stats["request_default_count"] += 1
@@ -115,8 +129,8 @@ async def recommendations_online(user_id: int, k: int = 100):
     resp = requests.post(
         events_store_url + "/get",
         headers=headers,
-        params={"user_id": user_id, "k": 3},
-        timeout=2,
+        params={"user_id": user_id, "k": EVENTS_K_LAST},
+        timeout=HTTP_TIMEOUT_SEC,
     )
     if resp.status_code != 200:
         return {"recs": []}
@@ -132,7 +146,7 @@ async def recommendations_online(user_id: int, k: int = 100):
             features_store_url + "/similar_items",
             headers=headers,
             params={"item_id": int(item_id), "k": k},
-            timeout=2,
+            timeout=HTTP_TIMEOUT_SEC,
         )
         if resp_sim.status_code != 200:
             continue
@@ -159,6 +173,18 @@ async def recommendations_online(user_id: int, k: int = 100):
 
     return {"recs": recs[:k]}
 
+def weighted_blend(online: list[int], offline: list[int], k: int) -> list[int]:
+    out = []
+    i = j = 0
+    while len(out) < k and (i < len(online) or j < len(offline)):
+        for _ in range(ONLINE_WEIGHT):
+            if i < len(online) and len(out) < k:
+                out.append(online[i]); i += 1
+        for _ in range(OFFLINE_WEIGHT):
+            if j < len(offline) and len(out) < k:
+                out.append(offline[j]); j += 1
+    return dedup_ids(out)[:k]
+
 @app.post("/recommendations")
 async def recommendations(user_id: int, k: int = 100):
     # отдельно
@@ -177,5 +203,5 @@ async def recommendations(user_id: int, k: int = 100):
     if len(recs_offline) > min_len:
         blended.extend(recs_offline[min_len:])
 
-    blended = dedup_ids(blended)[:k]
+    blended = weighted_blend(recs_online, recs_offline, k)
     return {"recs": blended}

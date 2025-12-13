@@ -11,6 +11,8 @@
 """
 
 import requests
+from requests.exceptions import RequestException
+from json import JSONDecodeError
 from datetime import datetime
 
 # URLs сервисов
@@ -32,11 +34,16 @@ def call(url: str, params: dict | None = None):
         (status_code, json_body | error_text)
     """
     params = params or {}
-    resp = requests.post(url, headers=headers, params=params, timeout=10)
+    try:
+        resp = requests.post(url, headers=headers, params=params, timeout=10)
+    except RequestException as e:
+        return 0, {"error": f"request failed: {e}"}
+
     try:
         body = resp.json()
-    except Exception:
+    except JSONDecodeError:
         body = {"error": resp.text}
+
     return resp.status_code, body
 
 def assert_ok(name: str, resp):
